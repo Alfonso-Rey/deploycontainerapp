@@ -1,0 +1,182 @@
+on:
+  workflow_call:
+    inputs:
+      service:
+        required: true
+        type: string
+      version:
+        required: true
+        type: string
+      env:
+        required: true
+        type: string
+
+jobs:
+  deploy-container-app:
+    permissions:
+      contents: read
+      id-token: write
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.env }}
+    env:
+      VERSION: ${{ inputs.version }}
+      SERVICE: ${{ inputs.service }}
+      ENVIRONMENT: ${{ inputs.env }}
+      AUTHENTICATION_API_KEY_CREDENTIALS_BLOB: ${{ secrets.AUTHENTICATION_API_KEY_CREDENTIALS_BLOB }}
+      RESOURCE_GROUP: ps-gateway-${{ inputs.env }}-aca-rg
+      REGISTRY_PASSWORD: ${{ secrets.REGISTRY_PASSWORD }}
+      CONTAINER_APP_NAME: ${{ inputs.service }}-${{ inputs.env }}-app
+      APPLICATIONINSIGHTS_ROLE_NAME: ${{ inputs.service }}
+      APPLICATIONINSIGHTS_CONNECTION_STRING: ${{ secrets.APPLICATION_INSIGHTS_CONNECTION_STRING }}
+      CONFIGURATION_SERVICE_DB_CONNECTION_STRING: ${{ secrets.CONFIGURATION_SERVICE_DB_CONNECTION_STRING }}
+      PASSWORD_ENCRYPTION_SECRET: ${{ secrets.PASSWORD_ENCRYPTION_SECRET }}
+      PASSWORD_ENCRYPTION_LIQUIBASE_SECRET: ${{ secrets.PASSWORD_ENCRYPTION_LIQUIBASE_SECRET }}
+      SERVICE_BUS_CONNECTION_STRING: ${{ secrets.SERVICE_BUS_CONNECTION_STRING }}
+      AZURE_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v2
+
+      - name: Azure Login
+        uses: azure/login@v1
+        with:
+          creds: '{"clientId":"${{ secrets.AZURE_CLIENT_ID }}","clientSecret":"${{ secrets.AZURE_CLIENT_SECRET }}","subscriptionId":"${{ vars.AZURE_SUBSCRIPTION_ID }}","tenantId":"${{ vars.AZURE_TENANT_ID }}"}'
+
+      # TODO: This should only be run for services that actually needs it.
+      - name: Determine service urls
+        uses: azure/CLI@v1
+        with:
+          inlineScript: |
+            az config set extension.use_dynamic_install=yes_without_prompt
+            az account set -s ${{ vars.AZURE_SUBSCRIPTION_ID }}
+            echo "CONFIGURATION_SERVICE_BASE_URL=$(echo "https://$(az containerapp show --resource-group ${{ env.RESOURCE_GROUP }} --name configuration-service-${{ inputs.env }}-app -o yaml | awk '/fqdn:/ {print $2}')" )" >> $GITHUB_ENV
+
+      - name: Prepare deployment yaml
+        run: cat services/${{ inputs.service }}/manifest/deployment.yaml | envsubst > substituted-deployment.yaml
+
+      - id: slack-notify-start-deployment
+        name: Notify start deployment
+        uses: slackapi/slack-github-action@v1.23.0
+        with:
+          channel-id: ${{ secrets.SLACK_CHANNEL_ID }}
+          payload: |
+            {
+              "text": "Deployment to `${{ inputs.env }}` by `${{ github.actor }}`",
+              "attachments": [
+                {
+                  "color": "warning",
+                  "fields": [
+                    {
+                      "title": "Status",
+                      "short": true,
+                      "value": "In progress"
+                    },
+                    {
+                      "title": "Job",
+                      "short": true,
+                      "value": "<${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|${{ github.run_id }}>"
+                    },
+                    {
+                      "title": "Service",
+                      "short": true,
+                      "value": "${{ inputs.service }}"
+                    },
+                    {
+                      "title": "Version",
+                      "short": true,
+                      "value": "${{ inputs.version }}"
+                    }
+                  ]
+                }
+              ]
+            }
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+
+      - name: Deploy
+        uses: azure/container-apps-deploy-action@v1
+        with:
+          containerAppEnvironment: ps-gateway-${{ inputs.env }}-env
+          containerAppName: ${{ env.CONTAINER_APP_NAME }}
+          resourceGroup: ${{ env.RESOURCE_GROUP }}
+          yamlConfigPath: substituted-deployment.yaml
+
+      - uses: slackapi/slack-github-action@v1.23.0
+        name: Notify completed deployment
+        if: ${{ success() }}
+        with:
+          channel-id: ${{ secrets.SLACK_CHANNEL_ID }}
+          update-ts: ${{ steps.slack-notify-start-deployment.outputs.ts }}
+          payload: |
+            {
+              "text": "Deployment to `${{ inputs.env }}` by `${{ github.actor }}`",
+              "attachments": [
+                {
+                  "color": "good",
+                  "fields": [
+                    {
+                      "title": "Status",
+                      "short": true,
+                      "value": "Completed"
+                    },
+                    {
+                      "title": "Job",
+                      "short": true,
+                      "value": "<${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|${{ github.run_id }}>"
+                    },
+                    {
+                      "title": "Service",
+                      "short": true,
+                      "value": "${{ inputs.service }}"
+                    },
+                    {
+                      "title": "Version",
+                      "short": true,
+                      "value": "${{ inputs.version }}"
+                    }
+                  ]
+                }
+              ]
+            }
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+
+      - uses: slackapi/slack-github-action@v1.23.0
+        name: Notify failed deployment
+        if: ${{ failure() }}
+        with:
+          channel-id: ${{ secrets.SLACK_CHANNEL_ID }}
+          update-ts: ${{ steps.slack-notify-start-deployment.outputs.ts }}
+          payload: |
+            {
+              "text": "Deployment to `${{ inputs.env }}` by `${{ github.actor }}`",
+              "attachments": [
+                {
+                  "color": "danger",
+                  "fields": [
+                    {
+                      "title": "Status",
+                      "short": true,
+                      "value": "Failed"
+                    },
+                    {
+                      "title": "Job",
+                      "short": true,
+                      "value": "<${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|${{ github.run_id }}>"
+                    },
+                    {
+                      "title": "Service",
+                      "short": true,
+                      "value": "${{ inputs.service }}"
+                    },
+                    {
+                      "title": "Version",
+                      "short": true,
+                      "value": "${{ inputs.version }}"
+                    }
+                  ]
+                }
+              ]
+            }
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
